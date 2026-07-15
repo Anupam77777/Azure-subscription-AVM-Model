@@ -1,0 +1,101 @@
+# =============================================================================
+# pipelines/azure-pipelines.yml
+# Deploys at MANAGEMENT GROUP scope using the AVM sub-vending module.
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - '**/*.bicep'
+      - '**/*.bicepparam'
+      - 'pipelines/*'
+
+parameters:
+  - name: environment
+    displayName: 'Environment to deploy'
+    type: string
+    default: 'dev'
+    values:
+      - dev
+      - prod
+
+variables:
+  # ARM service connection. Its identity needs:
+  #   - Owner/Contributor on the deployment management group
+  #   - A billing role on the billing scope (to create subscriptions)
+  #   - Network Contributor on the hub RG/subscription (for hub<->spoke peering)
+  azureServiceConnection: 'sc-azure-mg-deploy'
+  # Management group the DEPLOYMENT runs in (often the platform/parent MG).
+  deploymentManagementGroupId: 'mg-landingzones-corp'
+  # Required metadata location for management-group-scope deployments.
+  location: 'eastus'
+  templateFile: 'main.bicep'
+  paramFile: 'parameters/${{ parameters.environment }}.bicepparam'
+
+stages:
+  # ---------------------------------------------------------------------------
+  - stage: Validate
+    displayName: 'Validate'
+    jobs:
+      - job: validate
+        pool:
+          vmImage: 'ubuntu-latest'
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: 'Bicep build (restores AVM module + lint)'
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az bicep build --file $(templateFile)
+
+          - task: AzureCLI@2
+            displayName: 'What-If (management group scope)'
+            continueOnError: true
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az deployment mg what-if \
+                  --management-group-id $(deploymentManagementGroupId) \
+                  --location $(location) \
+                  --template-file $(templateFile) \
+                  --parameters $(paramFile)
+
+  # ---------------------------------------------------------------------------
+  - stage: Deploy
+    displayName: 'Create Subscription + Landing Zone (AVM)'
+    dependsOn: Validate
+    condition: succeeded()
+    jobs:
+      - deployment: deployMg
+        displayName: 'Deploy ${{ parameters.environment }}'
+        environment: ${{ parameters.environment }}   # add approvals here for prod
+        pool:
+          vmImage: 'ubuntu-latest'
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+
+                - task: AzureCLI@2
+                  displayName: 'az deployment mg create'
+                  inputs:
+                    azureSubscription: $(azureServiceConnection)
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    inlineScript: |
+                      az deployment mg create \
+                        --name lz-$(Build.BuildId) \
+                        --management-group-id $(deploymentManagementGroupId) \
+                        --location $(location) \
+                        --template-file $(templateFile) \
+                        --parameters $(paramFile)
